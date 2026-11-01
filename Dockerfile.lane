@@ -1,0 +1,143 @@
+# syntax=docker/dockerfile:1
+# Multi-arch base (amd64+arm64): devcontainers/universal is amd64-only and
+# DinD does not work under emulation on Apple Silicon.
+FROM mcr.microsoft.com/devcontainers/base:ubuntu
+
+ARG CLAUDE_CODE_VERSION=2.1.311
+ENV DEBIAN_FRONTEND=noninteractive
+
+USER root
+# pipefail: a failed download in `curl ... | sh` fails the build instead of running nothing.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates gnupg zip unzip sudo \
+    tmux \
+    python3 python3-pip python3-venv \
+    build-essential \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+    https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+    > /etc/apt/sources.list.d/docker.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    docker-ce docker-ce-cli containerd.io \
+    docker-buildx-plugin docker-compose-plugin \
+    && rm -rf /var/lib/apt/lists/*
+
+# Sessions run as `lane`: fixed uid so populate can chown to it, remapped to
+# the host uid at container start on Linux. Full sudo: the lane is a disposable
+# box and its inner docker socket is root-equivalent anyway.
+RUN useradd -u 1001 -m -s /bin/bash lane \
+    && echo 'lane ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/lane
+
+# Go is its own installer: GOTOOLCHAIN=auto fetches whatever version go.mod asks for.
+ARG GO_VERSION=1.25.1
+ARG UV_VERSION=0.12.14
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz" \
+    | tar -xz -C /usr/local \
+    && pip3 install --no-cache-dir --break-system-packages "uv==${UV_VERSION}"
+
+# Installers only, under /opt (world-writable so a remapped uid can use them):
+# the model installs what the repo asks for -- fnm use, uv, sdk install, rustup, go.
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo SDKMAN_DIR=/opt/sdkman FNM_DIR=/opt/fnm \
+    GOTOOLCHAIN=auto \
+    PATH="/usr/local/go/bin:/opt/cargo/bin:/opt/sdkman/candidates/java/current/bin:/opt/fnm/aliases/default/bin:${PATH}"
+ARG FNM_VERSION=1.38.1
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path \
+    && FNM_ASSET="$(if [ "$(dpkg --print-architecture)" = "amd64" ]; then echo fnm-linux; else echo fnm-arm64; fi)" \
+    && curl -fsSL "https://github.com/Schniz/fnm/releases/download/v${FNM_VERSION}/${FNM_ASSET}.zip" -o /tmp/fnm.zip \
+    && unzip -o /tmp/fnm.zip -d /tmp/fnm && rm /tmp/fnm.zip \
+    && install -m 0755 /tmp/fnm/fnm /usr/local/bin/fnm && rm -rf /tmp/fnm && mkdir -p /opt/fnm \
+    && curl -fsSL "https://get.sdkman.io?rcupdate=false" | bash \
+    && printf '#!/bin/bash\nsource /opt/sdkman/bin/sdkman-init.sh\nsdk "$@"\n' > /usr/local/bin/sdk \
+    && chmod +x /usr/local/bin/sdk \
+    && printf '%s\n' \
+    '# The lane launcher runs `sh -lc`, so dash sources this too. fnm env and' \
+    '# sdkman-init.sh are both bash, so gate them and give dash PATH the POSIX way.' \
+    'if [ -n "${BASH_VERSION:-}" ]; then' \
+    '  eval "$(fnm env --use-on-cd --shell bash)"' \
+    '  . /opt/sdkman/bin/sdkman-init.sh' \
+    'else' \
+    '  eval "$(fnm env --shell bash)"' \
+    '  for _d in /opt/sdkman/candidates/*/current/bin; do' \
+    '    if [ -d "$_d" ]; then PATH="$_d:$PATH"; fi' \
+    '  done' \
+    '  unset _d; export PATH' \
+    'fi' \
+    > /etc/profile.d/lane-toolchains.sh \
+    && chmod -R a+rwX /opt/rustup /opt/cargo /opt/sdkman /opt/fnm
+# A default Node so node/npm/npx resolve in Claude Code's non-login shell; other versions via fnm.
+ARG NODE_VERSION=24.21.0
+RUN fnm install "${NODE_VERSION}" && fnm default "${NODE_VERSION}" \
+    && chmod -R a+rwX /opt/fnm
+
+# Claude Code's native installer lands under $HOME; keep that out of /home/lane too.
+RUN HOME=/opt/claude bash -c 'curl -fsSL https://claude.ai/install.sh | bash -s -- '"${CLAUDE_CODE_VERSION}" \
+    && chmod -R a+rX /opt/claude \
+    && ln -sf /opt/claude/.local/bin/claude /usr/local/bin/claude \
+    && git config --system --add safe.directory '*'
+
+# Install Kilo CLI globally (agent-agnostic; works alongside Claude Code)
+RUN . /etc/profile.d/lane-toolchains.sh 2>/dev/null || true \
+    && export PATH="/opt/fnm/aliases/default/bin:$PATH" \
+    && npm install -g @kilocode/cli \
+    && (command -v kilo || command -v kilocode || find /opt/fnm -name 'kilo*' -o -name 'kilocode*' 2>&1 | head -5) \
+    && chmod -R a+rwX /opt/fnm 2>/dev/null || true
+# Root PID 1: remap lane to the host uid before any lane process exists (Linux
+# hosts pass LANE_UID), run the inner daemon, open its socket to lane, exit if
+# the daemon dies.
+RUN <<'EOF'
+cat > /usr/local/bin/lane-entrypoint.sh <<'SH'
+#!/bin/bash
+set -eu
+[ "$#" -gt 0 ] && exec "$@"   # one-shot helpers (populate, export) run their command instead of the daemon
+if [ -n "${LANE_UID:-}" ] && [ "$LANE_UID" != "$(id -u lane)" ]; then
+  usermod -o -u "$LANE_UID" lane && chown -R lane /home/lane
+fi
+# Docker Desktop lets any container reach host-published ports through this
+# name; blackhole it so the sibling lane's dev servers stay out of reach.
+for _ip in $(getent ahostsv4 host.docker.internal 2>/dev/null | awk '{print $1}' | sort -u); do
+  ip route add blackhole "$_ip" 2>/dev/null || true
+done
+/usr/bin/dockerd >/var/log/dockerd.log 2>&1 & DIND=$!
+( while [ ! -S /var/run/docker.sock ]; do sleep 0.2; done; chmod 666 /var/run/docker.sock ) &
+wait "$DIND"
+SH
+chmod +x /usr/local/bin/lane-entrypoint.sh
+EOF
+# The lane session runs under tmux so a dropped terminal detaches instead of
+# killing it (see write_lane_wrappers). Nothing here is cosmetic:
+#   prefix None -- Claude Code sends a command to the background with ctrl+b,
+#                  which is tmux's default prefix. `unbind C-b` does NOT free
+#                  it: the prefix is an option, and unbinding the key leaves
+#                  `prefix C-b` set and still swallowing it. Verified on 3.7c.
+#                  With no prefix there is no way to detach by hand either,
+#                  which is fine: closing the terminal now detaches on its own.
+#   status off  -- an expert who has never used tmux should not be able to tell.
+#   C-z         -- ctrl+z makes Claude Code hand the terminal back and signal
+#                  itself. The pane's process group is orphaned, so the kernel
+#                  drops that SIGTSTP and the session runs on with its UI torn
+#                  down: alive, but looks dead. A root-table binding swallows
+#                  the key before the pane sees it. Verified on tmux 3.4: the
+#                  keys either side of a ctrl+z still reach the pane, ^Z does
+#                  not.
+RUN cat > /home/lane/.tmux.lane.conf <<'CONF' && chown lane /home/lane/.tmux.lane.conf
+set -g prefix None
+unbind C-b
+bind -n C-z run-shell 'true'
+set -g status off
+set -g mouse on
+set -g escape-time 0
+set -g history-limit 50000
+CONF
+
+ENTRYPOINT ["/usr/local/bin/lane-entrypoint.sh"]
+
+USER lane
+
+# The lane's workload daemon is the inner DinD one — surface it in docker ps.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s \
+    CMD docker info >/dev/null 2>&1 || exit 1
